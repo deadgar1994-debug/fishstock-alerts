@@ -1,0 +1,15 @@
+# node
+node_modules/
+.env
+
+# expo
+.expo/
+web-build/
+
+# databases
+*.sqlite
+*.sqlite-journal
+
+# OS
+.DS_Store
+Thumbs.db
