@@ -1,12 +1,25 @@
 name: Run poller daily
 
 on:
+  schedule:
+    # 9:05 AM Utah winter time = 16:05 UTC
+    - cron: "5 16 * * *"
   workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Call poller endpoint (HARDCODED TEST)
+      - name: Call poller endpoint (handles Render cold start)
+        env:
+          POLLER_URL: ${{ secrets.POLLER_URL }}
         run: |
-          curl -v -X POST "https://fishstock-alerts.onrender.com/run-poller?key=1g5df61g5df1g6d51h5g1j15yyuk1"
+          echo "Calling poller..."
+          # printf removes hidden newlines/spaces that can break curl
+          URL="$(printf '%s' "$POLLER_URL")"
+
+          curl -sS -f -X POST "$URL" \
+            --max-time 120 \
+            --retry 8 \
+            --retry-delay 10 \
+            --retry-all-errors
