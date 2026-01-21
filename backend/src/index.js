@@ -27,7 +27,9 @@ async function fetchLiveEvents() {
 }
 
 /* ---------------- health ---------------- */
-app.get("/health", (_, res) => res.json({ ok: true }));
+app.get("/version", (_, res) => {
+  res.json({ ok: true, version: "v-meta-1" });
+});
 
 /* ---------------- subscribe ---------------- */
 app.post("/subscribe", (req, res) => {
