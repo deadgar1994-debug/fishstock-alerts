@@ -2,14 +2,32 @@ name: Run poller daily
 
 on:
   schedule:
-    # Daily at 9:05 AM Denver time (winter). GitHub cron is UTC.
     - cron: "5 16 * * *"
   workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    env:
+      POLLER_URL: ${{ secrets.POLLER_URL }}
     steps:
-      - name: Call poller endpoint
+      - name: Sanity check secret (no leak)
         run: |
-          curl -sS -X POST "${{ secrets.POLLER_URL }}"
+          python - <<'PY'
+          import os
+          url = os.environ.get("POLLER_URL","")
+          print("POLLER_URL length:", len(url))
+          print("Starts with https:// :", url.startswith("https://"))
+          print("Contains spaces:", " " in url)
+          print("Contains newline:", "\\n" in url)
+          PY
+
+      - name: Call poller endpoint (retry for cold start)
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "Attempt $i..."
+            curl -v -X POST "$POLLER_URL" && exit 0
+            echo "Retrying in 20s..."
+            sleep 20
+          done
+          exit 1
