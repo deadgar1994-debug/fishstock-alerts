@@ -1,14 +1,11 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import fetch from "node-fetch";
 dotenv.config();
 
-import {
-  upsertSubscription,
-  getRecentEvents,
-  listSubscriptions,
-} from "./db.js";
-
+import { parseDwrFishStockingHtml } from "./dwrParser.js";
+import { upsertSubscription, listSubscriptions } from "./db.js";
 import { sendExpoPushMessages } from "./notify.js";
 import { runPollOnce } from "./runPollOnce.js";
 
@@ -26,10 +23,7 @@ app.post("/subscribe", (req, res) => {
   const { expo_push_token, counties, species, waters } = req.body || {};
 
   if (!expo_push_token || typeof expo_push_token !== "string") {
-    return res.status(400).json({
-      ok: false,
-      error: "expo_push_token required",
-    });
+    return res.status(400).json({ ok: false, error: "expo_push_token required" });
   }
 
   upsertSubscription({
@@ -42,16 +36,13 @@ app.post("/subscribe", (req, res) => {
   res.json({ ok: true });
 });
 
-/* ---------------- run poller (protected) ---------------- */
+/* ---------------- run poller (cron / github actions) ---------------- */
 app.post("/run-poller", async (req, res) => {
   try {
     const key = String(req.query.key || "");
-    const expected = String(process.env.CRON_KEY || "");
-
-    if (!expected || key !== expected) {
+    if (!process.env.CRON_KEY || key !== process.env.CRON_KEY) {
       return res.status(401).json({ ok: false, error: "Unauthorized" });
     }
-
     const result = await runPollOnce();
     res.json({ ok: true, result });
   } catch (e) {
@@ -59,11 +50,33 @@ app.post("/run-poller", async (req, res) => {
   }
 });
 
-/* ---------------- recent events ---------------- */
-app.get("/events/recent", (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || "50", 10) || 50, 200);
-  const events = getRecentEvents(limit);
-  res.json({ ok: true, events });
+/* ---------------- recent events (LIVE PARSE, $0 hosting friendly) ---------------- */
+app.get("/events/recent", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || "50", 10) || 50, 200);
+
+    const pollUrl = process.env.POLL_URL;
+    if (!pollUrl) {
+      return res.status(500).json({ ok: false, error: "Missing POLL_URL in env" });
+    }
+
+    const ua = process.env.POLL_USER_AGENT || "FishStockAlerts/0.1";
+
+    const r = await fetch(pollUrl, {
+      headers: { "User-Agent": ua, Accept: "text/html" },
+    });
+
+    if (!r.ok) throw new Error(`Fetch failed: ${r.status}`);
+    const html = await r.text();
+
+    const events = parseDwrFishStockingHtml(html)
+      .sort((a, b) => String(b.date_stocked).localeCompare(String(a.date_stocked)))
+      .slice(0, limit);
+
+    res.json({ ok: true, events });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 /* ---------------- TEST PUSH ---------------- */
@@ -86,13 +99,11 @@ app.post("/test-push", async (req, res) => {
       }));
 
     if (!messages.length) {
-      return res.json({
-        ok: false,
-        error: "No real Expo push tokens found.",
-      });
+      return res.json({ ok: false, error: "No real Expo push tokens found." });
     }
 
     const result = await sendExpoPushMessages(messages);
+
     res.json({ ok: true, sent: result.sent });
   } catch (e) {
     console.error("test-push error:", e);
@@ -102,6 +113,7 @@ app.post("/test-push", async (req, res) => {
 
 /* ---------------- start server ---------------- */
 const port = parseInt(process.env.PORT || "8787", 10);
+
 app.listen(port, () => {
   console.log(`API listening on http://localhost:${port}`);
 });
