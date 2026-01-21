@@ -13,10 +13,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+/* ---------------- helpers ---------------- */
+async function fetchLiveEvents() {
+  const pollUrl = process.env.POLL_URL;
+  if (!pollUrl) throw new Error("Missing POLL_URL in env");
+
+  const ua = process.env.POLL_USER_AGENT || "FishStockAlerts/0.1";
+  const r = await fetch(pollUrl, { headers: { "User-Agent": ua, Accept: "text/html" } });
+  if (!r.ok) throw new Error(`Fetch failed: ${r.status}`);
+
+  const html = await r.text();
+  return parseDwrFishStockingHtml(html);
+}
+
 /* ---------------- health ---------------- */
-app.get("/health", (_, res) => {
-  res.json({ ok: true });
-});
+app.get("/health", (_, res) => res.json({ ok: true }));
 
 /* ---------------- subscribe ---------------- */
 app.post("/subscribe", (req, res) => {
@@ -50,26 +61,11 @@ app.post("/run-poller", async (req, res) => {
   }
 });
 
-/* ---------------- recent events (LIVE PARSE, $0 hosting friendly) ---------------- */
+/* ---------------- recent events (LIVE PARSE) ---------------- */
 app.get("/events/recent", async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || "50", 10) || 50, 200);
-
-    const pollUrl = process.env.POLL_URL;
-    if (!pollUrl) {
-      return res.status(500).json({ ok: false, error: "Missing POLL_URL in env" });
-    }
-
-    const ua = process.env.POLL_USER_AGENT || "FishStockAlerts/0.1";
-
-    const r = await fetch(pollUrl, {
-      headers: { "User-Agent": ua, Accept: "text/html" },
-    });
-
-    if (!r.ok) throw new Error(`Fetch failed: ${r.status}`);
-    const html = await r.text();
-
-    const events = parseDwrFishStockingHtml(html)
+    const events = (await fetchLiveEvents())
       .sort((a, b) => String(b.date_stocked).localeCompare(String(a.date_stocked)))
       .slice(0, limit);
 
@@ -79,16 +75,39 @@ app.get("/events/recent", async (req, res) => {
   }
 });
 
+/* ---------------- meta (dropdown lists) ---------------- */
+app.get("/meta/counties", async (_req, res) => {
+  try {
+    const events = await fetchLiveEvents();
+    const counties = Array.from(
+      new Set(events.map((e) => String(e.county || "").trim()).filter(Boolean))
+    ).sort();
+    res.json({ ok: true, counties });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get("/meta/species", async (_req, res) => {
+  try {
+    const events = await fetchLiveEvents();
+    const species = Array.from(
+      new Set(events.map((e) => String(e.species || "").trim()).filter(Boolean))
+    ).sort();
+    res.json({ ok: true, species });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 /* ---------------- TEST PUSH ---------------- */
-app.post("/test-push", async (req, res) => {
+app.post("/test-push", async (_req, res) => {
   try {
     const subs = listSubscriptions();
 
     const messages = subs
       .filter(
-        (s) =>
-          s.expo_push_token &&
-          !String(s.expo_push_token).includes("TESTTOKEN")
+        (s) => s.expo_push_token && !String(s.expo_push_token).includes("TESTTOKEN")
       )
       .map((s) => ({
         to: s.expo_push_token,
@@ -103,7 +122,6 @@ app.post("/test-push", async (req, res) => {
     }
 
     const result = await sendExpoPushMessages(messages);
-
     res.json({ ok: true, sent: result.sent });
   } catch (e) {
     console.error("test-push error:", e);
@@ -113,7 +131,4 @@ app.post("/test-push", async (req, res) => {
 
 /* ---------------- start server ---------------- */
 const port = parseInt(process.env.PORT || "8787", 10);
-
-app.listen(port, () => {
-  console.log(`API listening on http://localhost:${port}`);
-});
+app.listen(port, () => console.log(`API listening on http://localhost:${port}`));
