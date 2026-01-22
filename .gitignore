@@ -1,15 +1,24 @@
 # node
 node_modules/
+npm-debug.log*
 .env
 
-# expo
-.expo/
-web-build/
+# expo / react native
+app/node_modules/
+app/.expo/
+app/.expo-shared/
+app/dist/
+app/web-build/
 
-# databases
-*.sqlite
-*.sqlite-journal
+# sqlite databases (DO NOT COMMIT RUNTIME FILES)
+backend/*.sqlite
+backend/*.sqlite-wal
+backend/*.sqlite-shm
+backend/*.sqlite-journal
+backend/*.db
+backend/*.db-wal
+backend/*.db-shm
 
-# OS
+# OS junk
 .DS_Store
 Thumbs.db
