@@ -14,12 +14,23 @@ app.use(cors());
 app.use(express.json());
 
 /* ---------------- helpers ---------------- */
-async function fetchLiveEvents() {
-  const pollUrl = process.env.POLL_URL;
-  if (!pollUrl) throw new Error("Missing POLL_URL in env");
+
+/**
+ * Fetch + parse DWR page.
+ * Supports optional year override (uses POLL_URL as base, but can override ?y=YYYY).
+ */
+async function fetchLiveEvents(year) {
+  const base = process.env.POLL_URL;
+  if (!base) throw new Error("Missing POLL_URL in env");
 
   const ua = process.env.POLL_USER_AGENT || "FishStockAlerts/0.1";
-  const r = await fetch(pollUrl, { headers: { "User-Agent": ua, Accept: "text/html" } });
+
+  const url = new URL(base);
+  if (year) url.searchParams.set("y", String(year));
+
+  const r = await fetch(url.toString(), {
+    headers: { "User-Agent": ua, Accept: "text/html" },
+  });
   if (!r.ok) throw new Error(`Fetch failed: ${r.status}`);
 
   const html = await r.text();
@@ -32,7 +43,8 @@ app.get("/health", (_, res) => {
 });
 
 app.get("/version", (_, res) => {
-  res.json({ ok: true, version: "v-meta-1" });
+  // bump this string whenever you want to confirm Render redeployed
+  res.json({ ok: true, version: "v-meta-2" });
 });
 
 /* ---------------- subscribe ---------------- */
@@ -71,7 +83,9 @@ app.post("/run-poller", async (req, res) => {
 app.get("/events/recent", async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || "50", 10) || 50, 200);
-    const events = (await fetchLiveEvents())
+    const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
+
+    const events = (await fetchLiveEvents(year))
       .sort((a, b) => String(b.date_stocked).localeCompare(String(a.date_stocked)))
       .slice(0, limit);
 
@@ -81,26 +95,106 @@ app.get("/events/recent", async (req, res) => {
   }
 });
 
-/* ---------------- meta (dropdown lists) ---------------- */
-app.get("/meta/counties", async (_req, res) => {
+/* ---------------- events: search + pagination ---------------- */
+/**
+ * GET /events?year=2026&county=WASATCH&species=RAINBOW&water=DEER&limit=50&offset=0
+ * - county/species are exact match (uppercased)
+ * - water is substring match (uppercased)
+ */
+app.get("/events", async (req, res) => {
   try {
-    const events = await fetchLiveEvents();
+    const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
+
+    const county = String(req.query.county || "").trim().toUpperCase();
+    const species = String(req.query.species || "").trim().toUpperCase();
+    const water = String(req.query.water || "").trim().toUpperCase();
+
+    const limit = Math.min(parseInt(req.query.limit || "50", 10) || 50, 200);
+    const offset = Math.max(parseInt(req.query.offset || "0", 10) || 0, 0);
+
+    const events = await fetchLiveEvents(year);
+
+    const filtered = events.filter((e) => {
+      const eCounty = String(e.county || "").trim().toUpperCase();
+      const eSpecies = String(e.species || "").trim().toUpperCase();
+      const eWater = String(e.water_name || "").trim().toUpperCase();
+
+      const cOk = !county || eCounty === county;
+      const sOk = !species || eSpecies === species;
+      const wOk = !water || eWater.includes(water);
+
+      return cOk && sOk && wOk;
+    });
+
+    filtered.sort((a, b) => String(b.date_stocked).localeCompare(String(a.date_stocked)));
+
+    const page = filtered.slice(offset, offset + limit);
+
+    res.json({
+      ok: true,
+      total: filtered.length,
+      limit,
+      offset,
+      events: page,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* ---------------- meta (dropdown lists) ---------------- */
+app.get("/meta/counties", async (req, res) => {
+  try {
+    const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
+
+    const events = await fetchLiveEvents(year);
     const counties = Array.from(
       new Set(events.map((e) => String(e.county || "").trim()).filter(Boolean))
     ).sort();
+
     res.json({ ok: true, counties });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.get("/meta/species", async (_req, res) => {
+app.get("/meta/species", async (req, res) => {
   try {
-    const events = await fetchLiveEvents();
+    const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
+
+    const events = await fetchLiveEvents(year);
     const species = Array.from(
       new Set(events.map((e) => String(e.species || "").trim()).filter(Boolean))
     ).sort();
+
     res.json({ ok: true, species });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * GET /meta/waters?county=WASATCH&year=2026
+ * If county is provided, returns only waters in that county.
+ */
+app.get("/meta/waters", async (req, res) => {
+  try {
+    const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
+    const county = String(req.query.county || "").trim().toUpperCase();
+
+    const events = await fetchLiveEvents(year);
+
+    let waters = events
+      .filter((e) => {
+        if (!county) return true;
+        return String(e.county || "").trim().toUpperCase() === county;
+      })
+      .map((e) => String(e.water_name || "").trim())
+      .filter(Boolean);
+
+    waters = Array.from(new Set(waters)).sort();
+
+    res.json({ ok: true, waters });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -112,9 +206,7 @@ app.post("/test-push", async (_req, res) => {
     const subs = listSubscriptions();
 
     const messages = subs
-      .filter(
-        (s) => s.expo_push_token && !String(s.expo_push_token).includes("TESTTOKEN")
-      )
+      .filter((s) => s.expo_push_token && !String(s.expo_push_token).includes("TESTTOKEN"))
       .map((s) => ({
         to: s.expo_push_token,
         sound: "default",
