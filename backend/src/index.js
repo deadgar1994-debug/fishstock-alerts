@@ -5,6 +5,8 @@ import fetch from "node-fetch";
 dotenv.config();
 
 import { parseDwrFishStockingHtml } from "./dwrParser.js";
+import { fetchColoradoEvents } from "./coParser.js";
+
 import { upsertSubscription, listSubscriptions } from "./db.js";
 import { sendExpoPushMessages } from "./notify.js";
 import { runPollOnce } from "./runPollOnce.js";
@@ -13,15 +15,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ---------------- helpers ---------------- */
+function normState(s) {
+  return String(s || "").trim().toUpperCase() || "UT";
+}
 
-/**
- * Fetch + parse DWR page.
- * Supports optional year override (uses POLL_URL as base, but can override ?y=YYYY).
- */
-async function fetchLiveEvents(year) {
-  const base = process.env.POLL_URL;
-  if (!base) throw new Error("Missing POLL_URL in env");
+/* ---------------- UT helper ---------------- */
+async function fetchUtahEvents(year) {
+  const base = process.env.POLL_URL_UT || process.env.POLL_URL; // fallback
+  if (!base) throw new Error("Missing POLL_URL_UT (or POLL_URL) in env");
 
   const ua = process.env.POLL_USER_AGENT || "FishStockAlerts/0.1";
 
@@ -31,23 +32,28 @@ async function fetchLiveEvents(year) {
   const r = await fetch(url.toString(), {
     headers: { "User-Agent": ua, Accept: "text/html" },
   });
-  if (!r.ok) throw new Error(`Fetch failed: ${r.status}`);
+  if (!r.ok) throw new Error(`UT fetch failed: ${r.status}`);
 
   const html = await r.text();
   return parseDwrFishStockingHtml(html);
 }
 
+/* ---------------- unified "get events" ---------------- */
+async function getEventsForState(state, year) {
+  const st = normState(state);
+  if (st === "CO") return await fetchColoradoEvents();
+  // default UT
+  return await fetchUtahEvents(year);
+}
+
 /* ---------------- health ---------------- */
-app.get("/health", (_, res) => {
-  res.json({ ok: true });
-});
+app.get("/health", (_, res) => res.json({ ok: true }));
 
 app.get("/version", (_, res) => {
-  // bump this string whenever you want to confirm Render redeployed
-  res.json({ ok: true, version: "v-meta-2" });
+  res.json({ ok: true, version: "v-meta-3" });
 });
 
-/* ---------------- subscribe ---------------- */
+/* ---------------- subscribe (still UT schema for now) ---------------- */
 app.post("/subscribe", (req, res) => {
   const { expo_push_token, counties, species, waters } = req.body || {};
 
@@ -65,7 +71,7 @@ app.post("/subscribe", (req, res) => {
   res.json({ ok: true });
 });
 
-/* ---------------- run poller (cron / github actions) ---------------- */
+/* ---------------- run poller (cron) ---------------- */
 app.post("/run-poller", async (req, res) => {
   try {
     const key = String(req.query.key || "");
@@ -79,13 +85,14 @@ app.post("/run-poller", async (req, res) => {
   }
 });
 
-/* ---------------- recent events (LIVE PARSE) ---------------- */
+/* ---------------- recent events ---------------- */
 app.get("/events/recent", async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit || "50", 10) || 50, 200);
     const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
+    const state = normState(req.query.state);
 
-    const events = (await fetchLiveEvents(year))
+    const events = (await getEventsForState(state, year))
       .sort((a, b) => String(b.date_stocked).localeCompare(String(a.date_stocked)))
       .slice(0, limit);
 
@@ -95,15 +102,11 @@ app.get("/events/recent", async (req, res) => {
   }
 });
 
-/* ---------------- events: search + pagination ---------------- */
-/**
- * GET /events?year=2026&county=WASATCH&species=RAINBOW&water=DEER&limit=50&offset=0
- * - county/species are exact match (uppercased)
- * - water is substring match (uppercased)
- */
+/* ---------------- events search + pagination ---------------- */
 app.get("/events", async (req, res) => {
   try {
     const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
+    const state = normState(req.query.state);
 
     const county = String(req.query.county || "").trim().toUpperCase();
     const species = String(req.query.species || "").trim().toUpperCase();
@@ -112,7 +115,7 @@ app.get("/events", async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit || "50", 10) || 50, 200);
     const offset = Math.max(parseInt(req.query.offset || "0", 10) || 0, 0);
 
-    const events = await fetchLiveEvents(year);
+    const events = await getEventsForState(state, year);
 
     const filtered = events.filter((e) => {
       const eCounty = String(e.county || "").trim().toUpperCase();
@@ -142,12 +145,13 @@ app.get("/events", async (req, res) => {
   }
 });
 
-/* ---------------- meta (dropdown lists) ---------------- */
+/* ---------------- meta ---------------- */
 app.get("/meta/counties", async (req, res) => {
   try {
     const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
+    const state = normState(req.query.state);
 
-    const events = await fetchLiveEvents(year);
+    const events = await getEventsForState(state, year);
     const counties = Array.from(
       new Set(events.map((e) => String(e.county || "").trim()).filter(Boolean))
     ).sort();
@@ -161,8 +165,9 @@ app.get("/meta/counties", async (req, res) => {
 app.get("/meta/species", async (req, res) => {
   try {
     const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
+    const state = normState(req.query.state);
 
-    const events = await fetchLiveEvents(year);
+    const events = await getEventsForState(state, year);
     const species = Array.from(
       new Set(events.map((e) => String(e.species || "").trim()).filter(Boolean))
     ).sort();
@@ -173,16 +178,13 @@ app.get("/meta/species", async (req, res) => {
   }
 });
 
-/**
- * GET /meta/waters?county=WASATCH&year=2026
- * If county is provided, returns only waters in that county.
- */
 app.get("/meta/waters", async (req, res) => {
   try {
     const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
+    const state = normState(req.query.state);
     const county = String(req.query.county || "").trim().toUpperCase();
 
-    const events = await fetchLiveEvents(year);
+    const events = await getEventsForState(state, year);
 
     let waters = events
       .filter((e) => {
