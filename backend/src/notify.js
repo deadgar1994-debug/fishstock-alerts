@@ -1,42 +1,46 @@
-import fetch from "node-fetch";
 
-export async function sendExpoPushMessages(messages) {
-  if (!messages.length) return { ok: true, sent: 0 };
-
-  const res = await fetch("https://exp.host/--/api/v2/push/send", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(messages),
-  });
-
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(`Expo push failed: ${res.status} ${JSON.stringify(json)}`);
-  }
-  return { ok: true, sent: messages.length, response: json };
+const BATCH_SIZE = 100;
+export function matchesSubscription(event, sub) {
+  const normalize = (x) => String(x || '').toUpperCase().trim();
+  const matches = (values, field) => !values?.length || values.some((v) => normalize(v) === normalize(field));
+  return matches(sub.states || ['UT'], event.state || 'UT')
+    && matches(sub.counties, event.county)
+    && matches(sub.species, event.species)
+    && matches(sub.waters, event.water_name);
 }
 
 export function formatNotification(event) {
-  const qty = event.quantity ? `${Number(event.quantity).toLocaleString()} fish` : "Fish stocked";
-  const len = event.avg_length ? ` • ${event.avg_length}" avg` : "";
+  const forecast = event.state === 'ID';
+  const quantity = Number(event.quantity) > 0 ? `${Number(event.quantity).toLocaleString()} fish` : 'Fish';
+  const length = Number(event.avg_length) > 0 ? ` • ${event.avg_length}\" avg` : '';
   return {
-    title: `Stocked: ${event.species}`,
-    body: `${event.water_name} (${event.county}) — ${qty}${len} — ${event.date_stocked}`,
-    data: { eventId: event.id },
+    title: forecast ? `Forecast: ${event.species}` : `New stocking: ${event.species}`,
+    body: `${event.water_name} (${event.state}) • ${quantity}${length} • ${event.date_stocked}${forecast ? ' (planned week)' : ''}`,
+    data: { kind: 'stocking', state: event.state, eventId: event.id, forecast },
   };
 }
 
-export function matchesSubscription(event, sub) {
-  const evCounty = String(event.county || "").toUpperCase().trim();
-  const evSpecies = String(event.species || "").toUpperCase().trim();
-  const evWater = String(event.water_name || "").toUpperCase().trim();
-
-  const subCounties = (sub.counties || []).map((x) => String(x).toUpperCase().trim());
-  const subSpecies = (sub.species || []).map((x) => String(x).toUpperCase().trim());
-  const subWaters = (sub.waters || []).map((x) => String(x).toUpperCase().trim());
-
-  const countyOk = !subCounties.length || subCounties.includes(evCounty);
-  const speciesOk = !subSpecies.length || subSpecies.includes(evSpecies);
-  const waterOk = !subWaters.length || subWaters.includes(evWater);
-  return countyOk && speciesOk && waterOk;
+export async function sendExpoPushMessages(messages) {
+  let accepted = 0;
+  const errors = [];
+  const acceptedIndices = [];
+  for (let i = 0; i < messages.length; i += BATCH_SIZE) {
+    const chunk = messages.slice(i, i + BATCH_SIZE);
+    const res = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chunk),
+      signal: AbortSignal.timeout(20000),
+    });
+    const response = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`Expo push service returned ${res.status}`);
+    const tickets = Array.isArray(response.data) ? response.data : [];
+    tickets.forEach((ticket, index) => {
+      if (ticket.status === 'ok') { accepted++; acceptedIndices.push(i + index); }
+      else errors.push(ticket.message || 'Push rejected');
+    });
+    if (!tickets.length) errors.push('Expo returned no push tickets');
+  }
+  // Acceptance is not confirmation of delivery. Receipt checking can be added later.
+  return { accepted, attempted: messages.length, acceptedIndices, errors: errors.slice(0, 10) };
 }

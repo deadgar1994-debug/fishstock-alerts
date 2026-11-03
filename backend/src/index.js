@@ -1,234 +1,148 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import fetch from "node-fetch";
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import { getEventsForState } from './eventService.js';
+import { getSupportedState, SUPPORTED_STATES } from './states.js';
+import { deleteSubscription, recordStateRequest, listStateRequests } from './db.js';
+import { requestedState } from './stateRequests.js';
+import { runPollOnce } from './runPollOnce.js';
 dotenv.config();
 
-import { parseDwrFishStockingHtml } from "./dwrParser.js";
-import { fetchColoradoEvents } from "./coParser.js";
-
-import { upsertSubscription, listSubscriptions } from "./db.js";
-import { sendExpoPushMessages } from "./notify.js";
-import { runPollOnce } from "./runPollOnce.js";
-
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.disable('x-powered-by');
+app.use(cors()); // Native mobile clients may not send Origin.
+app.use(express.json({ limit: '16kb' }));
 
-function normState(s) {
-  return String(s || "").trim().toUpperCase() || "UT";
+function failure(res, error) {
+  const status = error?.status || 503;
+  console.error('[API]', error?.message || error);
+  return res.status(status).json({ ok: false, error: error?.message || 'Data temporarily unavailable' });
 }
-
-/* ---------------- UT helper ---------------- */
-async function fetchUtahEvents(year) {
-  const base = process.env.POLL_URL_UT || process.env.POLL_URL; // fallback
-  if (!base) throw new Error("Missing POLL_URL_UT (or POLL_URL) in env");
-
-  const ua = process.env.POLL_USER_AGENT || "FishStockAlerts/0.1";
-
-  const url = new URL(base);
-  if (year) url.searchParams.set("y", String(year));
-
-  const r = await fetch(url.toString(), {
-    headers: { "User-Agent": ua, Accept: "text/html" },
-  });
-  if (!r.ok) throw new Error(`UT fetch failed: ${r.status}`);
-
-  const html = await r.text();
-  return parseDwrFishStockingHtml(html);
-}
-
-/* ---------------- unified "get events" ---------------- */
-async function getEventsForState(state, year) {
-  const st = normState(state);
-  if (st === "CO") return await fetchColoradoEvents();
-  // default UT
-  return await fetchUtahEvents(year);
-}
-
-/* ---------------- health ---------------- */
-app.get("/health", (_, res) => res.json({ ok: true }));
-
-app.get("/version", (_, res) => {
-  res.json({ ok: true, version: "v-meta-3" });
-});
-
-/* ---------------- subscribe (still UT schema for now) ---------------- */
-app.post("/subscribe", (req, res) => {
-  const { expo_push_token, counties, species, waters } = req.body || {};
-
-  if (!expo_push_token || typeof expo_push_token !== "string") {
-    return res.status(400).json({ ok: false, error: "expo_push_token required" });
+function yearFrom(req) {
+  if (req.query.year === undefined) return undefined;
+  const year = Number(req.query.year);
+  if (!Number.isInteger(year) || year < 2000 || year > 2100) {
+    const error = new Error('Invalid year'); error.status = 400; throw error;
   }
+  return year;
+}
+function pagination(req) {
+  return {
+    limit: Math.max(1, Math.min(Number.parseInt(String(req.query.limit || '50'), 10) || 50, 500)),
+    offset: Math.max(0, Number.parseInt(String(req.query.offset || '0'), 10) || 0),
+  };
+}
+function safeFilters(body) {
+  const normalize = (value) => [...new Set((Array.isArray(value) ? value : [])
+    .slice(0, 60).map((v) => String(v).trim().toUpperCase().slice(0, 120)).filter(Boolean))];
+  return {
+    states: normalize(body.states?.length ? body.states : ['UT']).map(getSupportedState),
+    counties: normalize(body.counties),
+    species: normalize(body.species),
+    waters: normalize(body.waters),
+  };
+}
+function validateToken(token) {
+  return typeof token === 'string' && token.length < 250 &&
+    /^(Expo(nent)?PushToken)\[[\w-]+\]$/.test(token);
+}
+function adminOnly(req, res, next) {
+  const configured = process.env.CRON_KEY;
+  const supplied = req.get('x-admin-key') || req.query.key;
+  if (!configured || supplied !== configured) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  next();
+}
+// Bound writes on public token-registration routes; production should also use hosting/WAF throttling.
+const hits = new Map();
+function limitWrites(req, res, next) {
+  const ip = req.ip || 'unknown';
+  const now = Date.now();
+  const hit = hits.get(ip);
+  if (!hit || now > hit.reset) hits.set(ip, { count: 1, reset: now + 60_000 });
+  else if (++hit.count > 30) return res.status(429).json({ ok: false, error: 'Too many requests' });
+  if (hits.size > 5000) hits.clear();
+  next();
+}
 
-  upsertSubscription({
-    expo_push_token,
-    counties: Array.isArray(counties) ? counties : [],
-    species: Array.isArray(species) ? species : [],
-    waters: Array.isArray(waters) ? waters : [],
-  });
+app.get('/health', (_, res) => res.json({ ok: true }));
+app.get('/version', (_, res) => res.json({ ok: true, version: 'fishsense-2.0.0' }));
+app.get('/meta/states', (_, res) => res.json({ ok: true, states: Object.values(SUPPORTED_STATES) }));
 
+// Older releases may still attempt to subscribe; this feature has been retired.
+app.post('/subscribe', (_req, res) => res.status(410).json({ ok: false, error: 'Stocking alerts have been discontinued.' }));
+
+// One simple selection; no account, message body, or contact details are collected.
+const requestLimits = new Map();
+app.post('/state-requests', limitWrites, (req, res) => {
+  const state = requestedState(req.body?.state);
+  if (!state) return res.status(400).json({ ok: false, error: 'Choose a state that is not already supported.' });
+  const ip = req.ip || 'unknown';
+  const now = Date.now();
+  const last = requestLimits.get(ip);
+  if (last && last.expires > now && last.count >= 5)
+    return res.status(429).json({ ok: false, error: 'Too many requests today. Please try again later.' });
+  try {
+    recordStateRequest(state);
+    if (!last || last.expires < now) requestLimits.set(ip, { count: 1, expires: now + 24 * 3600_000 });
+    else last.count++;
+    if (requestLimits.size > 5000) requestLimits.clear();
+    res.json({ ok: true, state });
+  } catch (error) { failure(res, error); }
+});
+app.get('/admin/state-requests', adminOnly, (_req, res) => res.json({ ok: true, requests: listStateRequests() }));
+
+app.post('/unsubscribe', limitWrites, (req, res) => {
+  const token = req.body?.expo_push_token;
+  if (!validateToken(token)) return res.status(400).json({ ok: false, error: 'Valid token required' });
+  deleteSubscription(token);
   res.json({ ok: true });
 });
 
-/* ---------------- run poller (cron) ---------------- */
-app.post("/run-poller", async (req, res) => {
-  try {
-    const key = String(req.query.key || "");
-    if (!process.env.CRON_KEY || key !== process.env.CRON_KEY) {
-      return res.status(401).json({ ok: false, error: "Unauthorized" });
-    }
-    const result = await runPollOnce();
-    res.json({ ok: true, result });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+app.post('/run-poller', adminOnly, async (_, res) => {
+  try { res.json({ ok: true, result: await runPollOnce() }); }
+  catch (error) { failure(res, error); }
 });
-
-/* ---------------- recent events ---------------- */
-app.get("/events/recent", async (req, res) => {
+app.get('/events/recent', async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit || "50", 10) || 50, 200);
-    const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
-    const state = normState(req.query.state);
-
-    const events = (await getEventsForState(state, year))
-      .sort((a, b) => String(b.date_stocked).localeCompare(String(a.date_stocked)))
-      .slice(0, limit);
-
-    res.json({ ok: true, events });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+    const state = getSupportedState(req.query.state);
+    const { events, stale } = await getEventsForState(state, yearFrom(req));
+    const { limit } = pagination(req);
+    res.json({ ok: true, state, stale, feed_type: SUPPORTED_STATES[state].feed_type,
+      events: [...events].sort((a, b) => String(b.date_stocked).localeCompare(String(a.date_stocked))).slice(0, limit) });
+  } catch (error) { failure(res, error); }
 });
-
-/* ---------------- events search + pagination ---------------- */
-app.get("/events", async (req, res) => {
+app.get('/events', async (req, res) => {
   try {
-    const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
-    const state = normState(req.query.state);
-
-    const county = String(req.query.county || "").trim().toUpperCase();
-    const species = String(req.query.species || "").trim().toUpperCase();
-    const water = String(req.query.water || "").trim().toUpperCase();
-
-    const limit = Math.min(parseInt(req.query.limit || "50", 10) || 50, 200);
-    const offset = Math.max(parseInt(req.query.offset || "0", 10) || 0, 0);
-
-    const events = await getEventsForState(state, year);
-
-    const filtered = events.filter((e) => {
-      const eCounty = String(e.county || "").trim().toUpperCase();
-      const eSpecies = String(e.species || "").trim().toUpperCase();
-      const eWater = String(e.water_name || "").trim().toUpperCase();
-
-      const cOk = !county || eCounty === county;
-      const sOk = !species || eSpecies === species;
-      const wOk = !water || eWater.includes(water);
-
-      return cOk && sOk && wOk;
-    });
-
+    const state = getSupportedState(req.query.state);
+    const { events, stale } = await getEventsForState(state, yearFrom(req));
+    const county = String(req.query.county || '').trim().toUpperCase();
+    const species = String(req.query.species || '').trim().toUpperCase();
+    const water = String(req.query.water || '').trim().toUpperCase();
+    const filtered = events.filter((e) =>
+      (!county || String(e.county).toUpperCase() === county) &&
+      (!species || String(e.species).toUpperCase() === species) &&
+      (!water || String(e.water_name).toUpperCase().includes(water)));
     filtered.sort((a, b) => String(b.date_stocked).localeCompare(String(a.date_stocked)));
-
-    const page = filtered.slice(offset, offset + limit);
-
-    res.json({
-      ok: true,
-      total: filtered.length,
-      limit,
-      offset,
-      events: page,
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+    const { limit, offset } = pagination(req);
+    res.json({ ok: true, state, stale, feed_type: SUPPORTED_STATES[state].feed_type,
+      total: filtered.length, limit, offset, events: filtered.slice(offset, offset + limit) });
+  } catch (error) { failure(res, error); }
 });
-
-/* ---------------- meta ---------------- */
-app.get("/meta/counties", async (req, res) => {
-  try {
-    const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
-    const state = normState(req.query.state);
-
-    const events = await getEventsForState(state, year);
-    const counties = Array.from(
-      new Set(events.map((e) => String(e.county || "").trim()).filter(Boolean))
-    ).sort();
-
-    res.json({ ok: true, counties });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
+for (const [route, key] of [['counties', 'county'], ['species', 'species'], ['waters', 'water_name']]) {
+  app.get(`/meta/${route}`, async (req, res) => {
+    try {
+      const state = getSupportedState(req.query.state);
+      const { events, stale } = await getEventsForState(state, yearFrom(req));
+      const county = String(req.query.county || '').trim().toUpperCase();
+      const values = [...new Set(events.filter((e) => key !== 'water_name' || !county ||
+        String(e.county).toUpperCase() === county).map((e) => String(e[key] || '').trim()).filter(Boolean))].sort();
+      res.json({ ok: true, state, stale, [route]: values });
+    } catch (error) { failure(res, error); }
+  });
+}
+app.use((error, _, res, next) => {
+  if (res.headersSent) return next(error);
+  return res.status(error?.status || 400).json({ ok: false, error: error?.message || 'Invalid request' });
 });
-
-app.get("/meta/species", async (req, res) => {
-  try {
-    const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
-    const state = normState(req.query.state);
-
-    const events = await getEventsForState(state, year);
-    const species = Array.from(
-      new Set(events.map((e) => String(e.species || "").trim()).filter(Boolean))
-    ).sort();
-
-    res.json({ ok: true, species });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.get("/meta/waters", async (req, res) => {
-  try {
-    const year = req.query.year ? parseInt(String(req.query.year), 10) : undefined;
-    const state = normState(req.query.state);
-    const county = String(req.query.county || "").trim().toUpperCase();
-
-    const events = await getEventsForState(state, year);
-
-    let waters = events
-      .filter((e) => {
-        if (!county) return true;
-        return String(e.county || "").trim().toUpperCase() === county;
-      })
-      .map((e) => String(e.water_name || "").trim())
-      .filter(Boolean);
-
-    waters = Array.from(new Set(waters)).sort();
-
-    res.json({ ok: true, waters });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* ---------------- TEST PUSH ---------------- */
-app.post("/test-push", async (_req, res) => {
-  try {
-    const subs = listSubscriptions();
-
-    const messages = subs
-      .filter((s) => s.expo_push_token && !String(s.expo_push_token).includes("TESTTOKEN"))
-      .map((s) => ({
-        to: s.expo_push_token,
-        sound: "default",
-        title: "Test Push ✅",
-        body: "If you see this, notifications are working.",
-        data: { kind: "test" },
-      }));
-
-    if (!messages.length) {
-      return res.json({ ok: false, error: "No real Expo push tokens found." });
-    }
-
-    const result = await sendExpoPushMessages(messages);
-    res.json({ ok: true, sent: result.sent });
-  } catch (e) {
-    console.error("test-push error:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-/* ---------------- start server ---------------- */
-const port = parseInt(process.env.PORT || "8787", 10);
-app.listen(port, () => console.log(`API listening on http://localhost:${port}`));
+const port = Number.parseInt(process.env.PORT || '8787', 10);
+app.listen(port, () => console.log(`[FishSense] API listening on ${port}`));
