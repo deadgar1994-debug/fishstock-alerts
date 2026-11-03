@@ -43,8 +43,40 @@ test('reject bad dates and malformed or changed API responses', () => {
   assert.equal(idahoDate('02/30/2026'),null);
   assert.equal(idahoDate('12/31/2025'),'2025-12-31');
   assert.throws(()=>parseIdahoApiPage({response:'error',total:1,rows:[]}),/unrecognized/);
-  assert.throws(()=>parseIdahoApiPage({response:'success',total:5,rows:[sourceRow({spp:undefined})]}),/invalid row|missing a valid/);
-  assert.throws(()=>parseIdahoApiPage({response:'success',total:2,rows:[sourceRow({n:'4,abc'})]}),/missing a valid/);
+  assert.throws(()=>parseIdahoApiPage({response:'success',total:1,rows:[sourceRow({spp:undefined})]}),/no usable/);
+  assert.throws(()=>parseIdahoApiPage({response:'success',total:1,rows:[sourceRow({n:'4,abc'})]}),/no usable/);
+});
+test('keep dated stocking records when county is absent; never invent a county', () => {
+  const p = parseIdahoApiPage({response:'success',total:2,rows:[sourceRow({loc:null}),sourceRow({loc:''})]});
+  assert.equal(p.rows.length,2);
+  assert.equal(p.rows[0].county,'Not specified');
+  assert.equal(p.skipped,0);
+});
+test('skip isolated unusable agency rows, but count the raw page size for pagination', async () => {
+  const dataset=[sourceRow(),sourceRow({n:'0'}),sourceRow({name:'Different',stocked:'10/29/2026'}),sourceRow({name:'Earlier',stocked:'12/31/2025'})];
+  const offsets=[];
+  const mockFetch=async url=>{
+    const offset=Number(new URL(url).searchParams.get('offset'));
+    offsets.push(offset);
+    return {ok:true,json:async()=>({response:'success',total:dataset.length,rows:dataset.slice(offset,offset+2)})};
+  };
+  const oldWarn=console.warn;
+  let warnings=[];
+  try {
+    console.warn=(...args)=>warnings.push(args.join(' '));
+    const events=await fetchIdahoEvents(2026,{fetchImpl:mockFetch,now:time,pageSize:2});
+    assert.deepEqual(offsets,[0,2]);
+    assert.equal(events.length,2);
+    assert.ok(warnings.some(x=>x.includes('skipped 1 incomplete record')));
+  } finally { console.warn=oldWarn; }
+});
+test('fail closed if many API records are malformed (schema drift)', async()=>{
+  const dataset=Array.from({length:100},(_,i)=>sourceRow({name:`Water ${i}`, n:i % 4===0?'?':'300'}));
+  const mockFetch=async url=>{
+    const offset=Number(new URL(url).searchParams.get('offset'));
+    return {ok:true,json:async()=>({response:'success',total:dataset.length,rows:dataset.slice(offset,offset+50)})};
+  };
+  await assert.rejects(fetchIdahoEvents(2026,{fetchImpl:mockFetch,now:time,pageSize:50}),/too many incomplete/);
 });
 test('API pagination advances by actual returned rows and ends at previous year', async () => {
   const allRows = [snapshot.rows[0], snapshot.rows[1], snapshot.rows[2], sourceRow({name:'Lake 2025',stocked:'12/31/2025'})];

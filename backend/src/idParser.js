@@ -29,6 +29,9 @@ export async function fetchIdahoEvents(year = new Date().getUTCFullYear(), optio
   let reachedOlderYear = false;
   let exhausted = false;
   const seenPages = new Set();
+  let sourceRowsSeen = 0;
+  let skippedRows = 0;
+  const skippedReasons = {};
 
   for (let page = 0; page < maxPages; page++) {
     const remaining = maxTimeMs - (Date.now() - started);
@@ -52,15 +55,24 @@ export async function fetchIdahoEvents(year = new Date().getUTCFullYear(), optio
     try { payload = await response.json(); }
     catch { throw new Error('Idaho stocking API returned invalid JSON.'); }
     const batch = parseIdahoApiPage(payload);
-    if (batch.rows.length === 0) {
+    if (batch.sourceCount === 0) {
       if (offset < batch.total) throw new Error('Idaho stocking API ended before its reported total.');
       exhausted = true;
       break;
     }
-    if (offset + batch.rows.length > batch.total) throw new Error('Idaho stocking API returned more rows than its reported total.');
-    const signature = crypto.createHash('sha256').update(JSON.stringify(batch.rows)).digest('hex');
+    if (offset + batch.sourceCount > batch.total) throw new Error('Idaho stocking API returned more rows than its reported total.');
+    const signature = crypto.createHash('sha256').update(JSON.stringify(payload.rows)).digest('hex');
     if (seenPages.has(signature)) throw new Error('Idaho stocking API repeated a page instead of advancing.');
     seenPages.add(signature);
+    sourceRowsSeen += batch.sourceCount;
+    skippedRows += batch.skipped;
+    for (const [reason, n] of Object.entries(batch.skippedReasons)) {
+      skippedReasons[reason] = (skippedReasons[reason] || 0) + n;
+    }
+    // Ignore isolated malformed records; fail if it looks like a schema change.
+    if (sourceRowsSeen >= 50 && skippedRows > Math.max(10, Math.floor(sourceRowsSeen * 0.1))) {
+      throw new Error('Idaho stocking API has too many incomplete records to trust the report.');
+    }
 
     for (const row of batch.rows) {
       if (row.date_stocked > previousDate) throw new Error('Idaho stocking API results were not sorted newest first.');
@@ -71,12 +83,13 @@ export async function fetchIdahoEvents(year = new Date().getUTCFullYear(), optio
       }
       rows.push(row);
     }
-    offset += batch.rows.length; // The API may cap `limit`; advance by returned rows, not requested count.
+    offset += batch.sourceCount; // Advance by RAW page size, including skipped rows, to avoid duplicate pages.
     if (reachedOlderYear || offset >= batch.total) {
       exhausted = true;
       break;
     }
   }
   if (!exhausted) throw new Error('Idaho stocking API pagination exceeded the safety limit; refusing incomplete totals.');
+  if (skippedRows) console.warn(`[FishSense] Idaho agency data: skipped ${skippedRows} incomplete record(s) out of ${sourceRowsSeen}; reasons: ${JSON.stringify(skippedReasons)}. Only verified records are counted.`);
   return collectIdahoReports(rows, { year: target, now });
 }

@@ -24,27 +24,48 @@ export function parseIdahoApiPage(payload) {
   }
   const total = Number(payload.total);
   if (total > 5000000) throw new Error('Idaho stocking API returned an unreasonable total.');
-  const rows = payload.rows.map((source) => {
+  // Historical data occasionally contains incomplete records. A single bad row
+  // should not blank the entire state, but malformed API shapes still fail.
+  const rows = [];
+  const skippedReasons = {};
+  for (const source of payload.rows) {
+    let reason = '';
     if (!source || typeof source !== 'object' || Array.isArray(source)) {
-      throw new Error('Idaho stocking API returned an invalid row.');
+      reason = 'invalid row shape';
+    } else {
+      const date_stocked = idahoDate(source.stocked);
+      const water_name = typeof source.name === 'string' ? source.name.trim() : '';
+      const species = typeof source.spp === 'string' ? source.spp.trim() : '';
+      // County may be absent in the agency's older records; it is not proof
+      // the actual release was invalid. Never invent a county name.
+      const county = typeof source.loc === 'string' && source.loc.trim()
+        ? source.loc.trim() : 'Not specified';
+      const quantityText = (typeof source.n === 'number' || typeof source.n === 'string')
+        ? String(source.n).trim() : '';
+      const cleanQuantity = quantityText.replace(/\s/g, '');
+      const quantity = Number(cleanQuantity.replace(/,/g, ''));
+      if (!date_stocked) reason = 'missing or invalid stocking date';
+      else if (!water_name) reason = 'missing water';
+      else if (!species) reason = 'missing species';
+      else if (!/^\d+$|^\d{1,3}(,\d{3})+$/.test(cleanQuantity) ||
+               !Number.isSafeInteger(quantity) || quantity <= 0) {
+        reason = 'missing or invalid positive quantity';
+      } else {
+        rows.push({
+          water_name, county, species, quantity, date_stocked, avg_length: null,
+          size_category: typeof source.len === 'string' ? source.len.trim() || null : null,
+          water_source_id: typeof source.id === 'string' ? source.id : String(source.id ?? ''),
+        });
+      }
     }
-    const date_stocked = idahoDate(source.stocked);
-    const water_name = typeof source.name === 'string' ? source.name.trim() : '';
-    const species = typeof source.spp === 'string' ? source.spp.trim() : '';
-    const county = typeof source.loc === 'string' ? source.loc.trim() : '';
-    const quantityText = typeof source.n === 'number' ? String(source.n) : String(source.n ?? '').trim();
-    const quantity = Number(quantityText.replace(/,/g, ''));
-    if (!date_stocked || !water_name || !species || !county || !/^\d{1,12}(,\d{3})*$/.test(quantityText) ||
-        !Number.isSafeInteger(quantity) || quantity <= 0) {
-      throw new Error('Idaho stocking API row is missing a valid water, county, species, quantity, or date.');
-    }
-    return {
-      water_name, county, species, quantity, date_stocked, avg_length: null,
-      size_category: typeof source.len === 'string' ? source.len.trim() || null : null,
-      water_source_id: typeof source.id === 'string' ? source.id : String(source.id ?? ''),
-    };
-  });
-  return { total, rows };
+    if (reason) skippedReasons[reason] = (skippedReasons[reason] || 0) + 1;
+  }
+  const sourceCount = payload.rows.length;
+  if (sourceCount > 0 && rows.length === 0) {
+    throw new Error('Idaho stocking API page contained no usable stocking records; check the source format.');
+  }
+  return { total, rows, sourceCount, skipped: sourceCount - rows.length, skippedReasons };
+
 }
 
 /**
