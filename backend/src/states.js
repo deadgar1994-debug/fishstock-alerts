@@ -2,7 +2,7 @@
 export const SUPPORTED_STATES = Object.freeze({
   UT: { code: 'UT', name: 'Utah', feed_type: 'reported', date_label: 'Stocked' },
   CO: { code: 'CO', name: 'Colorado', feed_type: 'reported', date_label: 'Reported' },
-  ID: { code: 'ID', name: 'Idaho', feed_type: 'forecast', date_label: 'Forecast week' },
+  ID: { code: 'ID', name: 'Idaho', feed_type: 'reported', date_label: 'Stocked' },
 });
 
 export function getSupportedState(raw) {

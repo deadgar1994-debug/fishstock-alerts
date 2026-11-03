@@ -31,7 +31,7 @@ export async function getEventsForState(rawState, year) {
     const promise = (async () => {
       try {
         const events = state === 'UT' ? await fetchUtahEvents(year)
-          : state === 'CO' ? await fetchColoradoEvents() : await fetchIdahoEvents();
+          : state === 'CO' ? await fetchColoradoEvents() : await fetchIdahoEvents(year);
         // Do not overwrite a healthy cache with an empty result caused by page changes.
         if (!Array.isArray(events) || (events.length === 0 && state !== 'ID')) throw new Error(`${state} source returned no parsed entries`);
         const normalized = events.map((e) => ({ ...e, state }));
@@ -39,7 +39,9 @@ export async function getEventsForState(rawState, year) {
         return { events: normalized, stale: false };
       } catch (error) {
         if (cached) return { events: cached.events, stale: true };
-        const dbFallback = getRecentEvents(5000, state);
+        // Legacy Idaho database entries were forecasts, not confirmed releases.
+        // Never revive them under the new reported-stockings label.
+        const dbFallback = state === 'ID' ? [] : getRecentEvents(5000, state);
         if (dbFallback.length) return { events: dbFallback, stale: true };
         throw error;
       }
